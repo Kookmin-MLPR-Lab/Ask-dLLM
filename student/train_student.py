@@ -1,0 +1,373 @@
+'Train a scorer to predict the final x row-max label.'
+
+from __future__ import annotations
+
+import argparse, glob, hashlib, json, random, sys, time
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from ask_dllm import (CustomCache, PromptUtilityStudent, StudentConfig,  # noqa: E402
+                      detect_family, load_model)
+from ask_dllm.dream_decoding import (  # noqa: E402
+    DreamDecoding, add_dream_arguments, require_matching_decoding)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    add_dream_arguments(p)
+    p.add_argument("--model", required=True,
+                   help="the checkpoint the teacher labels were extracted with. "
+                        "Required, and checked against the shards: the replay "
+                        "forward has to reproduce the hidden states the selection "
+                        "was made from, so a different model trains on states "
+                        "deployment never sees")
+    p.add_argument("--teacher-root", required=True,
+                   help="comma-separated for mixed-domain training: val is split "
+                        "per domain and the checkpoint is chosen on the domain "
+                        "macro average, so a block-heavy domain cannot own it")
+    p.add_argument("--output-dir", default="",
+                   help="default: artifacts/ckpts/<auto name>, see checkpoint_name()")
+    p.add_argument("--name", default="",
+                   help="override just the directory name under artifacts/ckpts")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--proj-dim", type=int, default=256)
+    p.add_argument("--mlp-dim", type=int, default=512)
+    p.add_argument("--val-ratio", type=float, default=0.1)
+    p.add_argument("--pairs", type=int, default=4096)
+    p.add_argument("--block-length", type=int, default=32,
+                   help="must match the teacher run; only used to size the "
+                        "replay forward's cache window")
+    p.add_argument("--max-seq-len", type=int, default=None,
+                   help="total token budget: LLaDA 4096, Dream 2048")
+    p.add_argument("--lambda-list", type=float, default=1.0,
+                   help="weight on the listwise KL against the pairwise term")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max-shards", default="",
+                   help="comma list aligned with --teacher-root: use only the first "
+                        "N prompts of each domain, 0 = all. The cut is taken before "
+                        "the val split, "
+                        "so val stays the same fraction of what is used.")
+    p.add_argument("--resume", action="store_true",
+                   help="resume from the latest checkpoint-epoch-* under the output directory")
+    return p.parse_args()
+
+
+def recall_grid(pred, target, ratios=(0.05, 0.1, 0.2, 0.3, 0.5)):
+    p = pred if pred.dim() == 2 else pred.unsqueeze(0)
+    t = target if target.dim() == 2 else target.unsqueeze(0)
+    n = t.shape[-1]
+    out = []
+    for r in ratios:
+        k = max(1, int(n * r))
+        chosen = p.topk(k, dim=-1).indices
+        mark = torch.zeros_like(t, dtype=torch.bool)
+        mark.scatter_(-1, t.topk(k, dim=-1).indices, True)
+        out.append(mark.gather(-1, chosen).sum(-1).float().mean() / k)
+    return float(sum(out) / len(out))
+
+
+def head_agreement(pred, ratio=0.2):
+    if pred.ndim == 1 or pred.shape[0] < 2:
+        return None
+    k = max(1, int(pred.shape[-1] * ratio))
+    sets = [set(row.tolist()) for row in torch.topk(pred, k, dim=-1).indices]
+    pairs = [len(a & b) / k for i, a in enumerate(sets) for b in sets[i + 1:]]
+    return sum(pairs) / len(pairs)
+
+
+def checkpoint_name(datasets, counts, epochs, lr):
+    tag = hashlib.sha1(",".join(sorted(datasets)).encode()).hexdigest()[:6]
+    lr_text = f"{lr:g}"
+    if "e" not in lr_text and lr < 0.01:
+        lr_text = f"{lr:.1e}".replace(".0e", "e")
+    lr_text = lr_text.replace("e-0", "e-")
+    return (f"{len(datasets)}ds_{'-'.join(str(c) for c in counts)}_e{epochs}"
+            f"_lr{lr_text}_blk_{tag}")
+
+
+def window_start(record):
+    return int(record.get("window_start", record["block_start"]))
+
+
+def window_length(record):
+    return int(record.get("window_length", record["block_length"]))
+
+
+def load_shard(path, attempts=3):
+    for i in range(attempts):
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except OSError:
+            if i == attempts - 1:
+                raise
+            time.sleep(5 * (i + 1))
+
+
+def main():
+    process_started = time.time()
+    args = parse_args()
+    if args.max_seq_len is None:
+        args.max_seq_len = 2048 if detect_family(args.model) == "dream" else 4096
+    if args.max_seq_len < 1:
+        raise SystemExit("--max-seq-len must be positive")
+    torch.manual_seed(args.seed); random.seed(args.seed)
+
+    model, backend = load_model(args.model, max_seq_len=args.max_seq_len,
+                                block_length=args.block_length, keep_ratio=1.0)
+    if args.max_seq_len > backend.native_max_seq_len:
+        print(f"warning: max_seq_len={args.max_seq_len} exceeds the checkpoint's "
+              f"trained context {backend.native_max_seq_len}", flush=True)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    device, L, H = model.device, backend.n_layers, backend.hidden_dim
+    print(f"backend={backend.name} layers={L} hidden={H}", flush=True)
+    decoding = None
+    if backend.name == "dream":
+        decoding = DreamDecoding.from_args(args).metadata()
+
+    def read_teacher(path):
+        shard = load_shard(path)
+        if decoding is not None:
+            require_matching_decoding(shard.get("decoding"), decoding, path)
+        return shard
+
+    roots = [r for r in args.teacher_root.split(",") if r]
+    shard_caps = [int(c) for c in args.max_shards.split(",")] if args.max_shards else []
+    if shard_caps and len(shard_caps) != len(roots):
+        raise SystemExit("--max-shards needs one entry per teacher root")
+    train_shards, val_shards, datasets = [], [], []
+    kinds, label_heads = set(), set()
+    for index, root in enumerate(roots):
+        name = Path(root).name
+        found = sorted(glob.glob(f"{root}/*.pt"))
+        if not found:
+            raise SystemExit(f"no teacher shards under {root}")
+        cap = shard_caps[index] if shard_caps else 0
+        if cap:
+            if cap > len(found):
+                raise SystemExit(f"{name}: asked for {cap} prompts, only {len(found)} exist")
+            found = found[:cap]
+        head = read_teacher(found[0])
+        shard_backend = head.get("backend")
+        if shard_backend is not None and shard_backend != backend.name:
+            raise SystemExit(
+                f"{name}: teacher labels were extracted with {shard_backend} "
+                f"({head.get('model', 'unknown checkpoint')}), but --model is a "
+                f"{backend.name} checkpoint. Pass the model the labels came from."
+            )
+        kinds.add(head.get("teacher_kind", "final_rowmax"))
+        if "num_label_heads" in head:
+            label_heads.add(int(head["num_label_heads"]))
+        split = max(1, int(len(found) * args.val_ratio))
+        val_shards += [(name, p) for p in found[:split]]
+        train_shards += [(name, p) for p in found[split:]]
+        datasets.append(name)
+        print(f"  {name}: train {len(found)-split} / val {split} shards"
+              f"{'' if shard_backend is None else f' [{shard_backend}]'}", flush=True)
+    print(f"train {len(train_shards)} / val {len(val_shards)} shards "
+          f"over {len(datasets)} domain(s)", flush=True)
+
+    if len(kinds) != 1 or len(label_heads) > 1:
+        raise SystemExit(f"teacher roots disagree on the label: kinds={sorted(kinds)} "
+                         f"heads={sorted(label_heads)}; train one kind at a time")
+    teacher_kind = sorted(kinds)[0]
+    per_head = "_per_head" in teacher_kind
+    K = sorted(label_heads)[0] if label_heads else None
+
+    counts = [sum(1 for n, _ in train_shards + val_shards if n == d) for d in datasets]
+    out_dir = Path(args.output_dir) if args.output_dir else (
+        REPO_ROOT / "artifacts" / "ckpts" /
+        (args.name or checkpoint_name(datasets, counts, args.epochs, args.lr)))
+    print(f"checkpoint -> {out_dir}", flush=True)
+
+    probe = load_shard(train_shards[0][1])["blocks"][0]["label_final_rowmax"]
+    attn_heads = int(probe.shape[1]) if probe.dim() == 3 else 1
+    print(f"teacher labels: {tuple(probe.shape)} -> attn_heads={attn_heads}", flush=True)
+    if K is None:
+        K = attn_heads
+    elif attn_heads != K:
+        raise SystemExit(f"shard metadata says {K} label heads but the label "
+                         f"tensor has {attn_heads}; the root is inconsistent")
+    if per_head != (K > 1):
+        raise SystemExit(f"teacher_kind={teacher_kind} but the label carries "
+                         f"{K} head(s)")
+    print(f"teacher_kind={teacher_kind} scorer emits {K} score(s) per candidate"
+          f"{' (per KV head)' if per_head else ' (head-averaged)'}", flush=True)
+    if per_head and attn_heads != backend.kv_heads:
+        raise SystemExit(f"teacher labels carry {attn_heads} heads but "
+                         f"{backend.name} has {backend.kv_heads} KV heads")
+
+    student_cfg = StudentConfig(attn_heads=attn_heads, layer_count=L, hidden_dim=H,
+                                proj_dim=args.proj_dim, mlp_dim=args.mlp_dim)
+    student = PromptUtilityStudent(student_cfg).to(device).float()
+    opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json.dump({"datasets": datasets, "samples": dict(zip(datasets, counts)),
+               "backend": backend.name, "model": str(args.model),
+               "decoding": decoding,
+               "block_length": args.block_length,
+               "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
+               "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
+               "attn_heads": attn_heads,
+               "val_ratio": args.val_ratio, "pairs": args.pairs,
+               "max_seq_len": args.max_seq_len,
+               "lambda_list": args.lambda_list,
+               "teacher_roots": roots,
+               "teacher_kind": teacher_kind,
+               "max_shards": dict(zip(datasets, shard_caps)) if shard_caps else {}},
+              open(out_dir / "meta.json", "w"), indent=2)
+
+    start_epoch = 0
+    best, run_started = -1.0, time.time()
+    if args.resume:
+        epoch_dirs = []
+        for path in out_dir.glob("checkpoint-epoch-*"):
+            try:
+                epoch_dirs.append((int(path.name.rsplit("-", 1)[-1]), path))
+            except ValueError:
+                continue
+        if not epoch_dirs:
+            raise SystemExit(f"--resume requested but no epoch checkpoints under {out_dir}")
+        last_epoch, last_dir = max(epoch_dirs)
+        weights = last_dir / "pytorch_model.bin"
+        optimizer = last_dir / "optimizer.pt"
+        state = last_dir / "trainer_state.json"
+        student.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
+        opt.load_state_dict(torch.load(optimizer, map_location=device, weights_only=True))
+        saved_state = json.loads(state.read_text())
+        start_epoch = int(saved_state["epoch"]) + 1
+        best_path = out_dir / "best.json"
+        if best_path.exists():
+            best = float(json.loads(best_path.read_text()).get("val_recall", -1.0))
+        if start_epoch >= args.epochs:
+            print(f"resume checkpoint is already at epoch {start_epoch}; requested epochs={args.epochs}", flush=True)
+            return 0
+        print(f"resuming from {last_dir} at epoch {start_epoch}", flush=True)
+
+    @torch.no_grad()
+    def features(record):
+        sequence_length = int(record["x_at_block_start"].numel())
+        if sequence_length > args.max_seq_len:
+            raise RuntimeError(
+                f"teacher record total length {sequence_length} exceeds "
+                f"--max-seq-len {args.max_seq_len}; use a matching student limit"
+            )
+        x = record["x_at_block_start"].unsqueeze(0).to(device)
+        cache = CustomCache(n_layers=L, device=device, keep_ratio=1.0,
+                            capture_hidden_states=True)
+        model(x, window_start(record), 1, cache)
+        return cache.layer_hidden_states
+
+    def step(record, train: bool):
+        hidden = features(record)
+        cand = record["candidate_indices"].to(device)
+        ws = window_start(record)
+        blk = torch.arange(ws, ws + window_length(record), device=device)
+        label = record["label_final_rowmax"].float().to(device)
+        total, recalls, agreements, label_agreements = 0.0, [], [], []
+        for l in range(L):
+            h = hidden[l].float()
+            pred = student.forward_layer(l, h, cand, blk).squeeze(0)
+            tgt = label[l]
+            rows_t = tgt if tgt.dim() == 2 else tgt.unsqueeze(0)
+            rows_p = pred if pred.dim() == 2 else pred.unsqueeze(0)
+            mass = rows_t.sum(-1)
+            usable = torch.isfinite(rows_t).all(-1) & (mass > 0)
+            if not bool(usable.any()):
+                continue
+            rows_t, rows_p = rows_t[usable], rows_p[usable]
+            kl = F.kl_div(F.log_softmax(rows_p, -1),
+                          rows_t / rows_t.sum(-1, keepdim=True),
+                          reduction="none").sum(-1)
+            loss = args.lambda_list * kl.mean()
+            i = torch.randint(0, rows_t.shape[-1], (args.pairs,), device=device)
+            j = torch.randint(0, rows_t.shape[-1], (args.pairs,), device=device)
+            sign = torch.sign(rows_t[..., i] - rows_t[..., j])
+            keep = sign != 0
+            if keep.any():
+                diff = rows_p[..., i] - rows_p[..., j]
+                loss = loss + F.softplus(-sign[keep] * diff[keep]).mean()
+            if train:
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+            total += float(loss.detach())
+            recalls.append(recall_grid(rows_p.detach(), rows_t))
+            agreement = head_agreement(rows_p.detach())
+            if agreement is not None:
+                agreements.append(agreement)
+                label_agreements.append(head_agreement(rows_t))
+        return (total / max(1, L), sum(recalls) / max(1, len(recalls)),
+                sum(agreements) / len(agreements) if agreements else None,
+                sum(label_agreements) / len(label_agreements) if label_agreements else None)
+
+    for epoch in range(start_epoch, args.epochs):
+        student.train(); random.shuffle(train_shards)
+        started, losses = time.time(), []
+        for n, (_, path) in enumerate(train_shards):
+            for record in read_teacher(path)["blocks"]:
+                losses.append(step(record, True)[0])
+            if (n + 1) % 30 == 0:
+                print(f"  epoch {epoch} {n+1}/{len(train_shards)} "
+                      f"loss {sum(losses[-120:])/max(1,len(losses[-120:])):.4f}", flush=True)
+        student.eval()
+        per_ds, agree, agree_label = {}, [], []
+        with torch.no_grad():
+            for name, p in val_shards:
+                for r in read_teacher(p)["blocks"]:
+                    _, recall, a, al = step(r, False)
+                    per_ds.setdefault(name, []).append(recall)
+                    if a is not None:
+                        agree.append(a); agree_label.append(al)
+        means = {k: sum(v) / max(1, len(v)) for k, v in per_ds.items()}
+        score = sum(means.values()) / max(1, len(means))
+        detail = "  ".join(f"{k} {v:.3f}" for k, v in sorted(means.items()))
+        head_line = ""
+        if agree:
+            head_line = (f" | head overlap@0.2 pred {sum(agree)/len(agree):.3f} "
+                         f"label {sum(agree_label)/len(agree_label):.3f}")
+        print(f"epoch {epoch}: loss {sum(losses)/len(losses):.4f} | "
+              f"val recall macro {score:.4f} [{detail}]{head_line} | "
+              f"{(time.time()-started)/60:.1f}min", flush=True)
+        epoch_dir = out_dir / f"checkpoint-epoch-{epoch:02d}"
+        student.save(epoch_dir)
+        torch.save(opt.state_dict(), epoch_dir / "optimizer.pt")
+        if decoding is not None:
+            with open(epoch_dir / "decoding.json", "w") as fh:
+                json.dump(decoding, fh, indent=2)
+        json.dump({"epoch": epoch, "val_recall": score,
+                   "val_recall_per_dataset": means},
+                  open(epoch_dir / "trainer_state.json", "w"), indent=2)
+        print(f"  saved epoch checkpoint -> {epoch_dir}", flush=True)
+        if score > best:
+            best = score
+            ckpt = out_dir / "checkpoint-best"
+            student.save(ckpt)
+            if decoding is not None:
+                with open(ckpt / "decoding.json", "w") as fh:
+                    json.dump(decoding, fh, indent=2)
+            json.dump({"val_recall": score, "val_recall_per_dataset": means,
+                       "epoch": epoch, "datasets": datasets, "kv_heads": K,
+                       "head_overlap_pred": sum(agree)/len(agree) if agree else None,
+                       "head_overlap_label": (sum(agree_label)/len(agree_label)
+                                              if agree_label else None)},
+                      open(out_dir / "best.json", "w"))
+            print(f"  saved (best {best:.4f})", flush=True)
+    print(f"done. best val recall {best:.4f} -> {out_dir}/checkpoint-best", flush=True)
+    print(f"cost: shards={len(train_shards) + len(val_shards)} epochs={args.epochs} "
+          f"train_h={(time.time() - run_started) / 3600:.4f} "
+          f"process_h={(time.time() - process_started) / 3600:.4f} "
+          f"peak_alloc_gib={torch.cuda.max_memory_allocated() / 2**30:.2f} "
+          f"peak_reserved_gib={torch.cuda.max_memory_reserved() / 2**30:.2f}",
+          flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
